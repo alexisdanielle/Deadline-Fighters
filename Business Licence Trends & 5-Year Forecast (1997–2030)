@@ -1,0 +1,155 @@
+# 1. Load Libraries
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(lubridate)
+
+# 2. Data Loading & The Fix (Unchanged)
+# -------------------------------------------------------------------------
+clean_date_load <- function(url) {
+  read_delim(url, delim = ";", show_col_types = FALSE) %>%
+    select(IssuedDate, BusinessType) %>%
+    mutate(
+      CleanDate = parse_date_time(IssuedDate, orders = c("ymd HMS", "ymd", "mdy HMS", "mdy")),
+      Year = year(CleanDate)
+    ) %>%
+    filter(!is.na(Year))
+}
+
+url_current <- "business-licences.csv"
+url_2013_2024 <- "business-licences-2013-to-2024.csv"
+url_1997_2012 <- "business-licences-1997-to-2012.csv"
+
+# Load raw data
+df_current_raw <- clean_date_load(url_current)
+df_2013_2024 <- clean_date_load(url_2013_2024)
+df_1997_2012 <- clean_date_load(url_1997_2012)
+
+# Fix overlap
+cutoff_year <- 2023
+
+df_history_clean <- bind_rows(df_1997_2012, df_2013_2024) %>%
+  filter(Year <= cutoff_year)
+
+df_current_clean <- df_current_raw %>%
+  filter(Year > cutoff_year)
+
+combined_data <- bind_rows(
+  df_history_clean %>% select(Year, BusinessType),
+  df_current_clean %>% select(Year, BusinessType)
+)
+
+# 3. Data Transformation (Unchanged)
+# ---------------------------------------
+combined_data <- combined_data %>%
+  filter(Year < 2025) %>%
+  filter(Year > 1996) %>%
+  mutate(Category = case_when(
+    grepl("Retail|Dealer|Shop|Store", BusinessType, ignore.case = TRUE) ~ "Retail",
+    grepl("Restaurant|Food|Cafe|Liquor|Pub", BusinessType, ignore.case = TRUE) ~ "Food & Bev",
+    grepl("Computer|Software|Tech|Consultant|Web", BusinessType, ignore.case = TRUE) ~ "Technology",
+    TRUE ~ "Other"
+  )) %>%
+  filter(Category %in% c("Retail", "Food & Bev", "Technology"))
+
+plot_data <- combined_data %>%
+  group_by(Year, Category) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  mutate(Type = "Historical")
+
+# 4. Forecasting (Unchanged)
+# -------------------------------
+future_years_count <- 5
+current_max_year <- max(plot_data$Year, na.rm = TRUE) # Should be 2024
+
+future_range <- data.frame(Year = seq(current_max_year + 1, current_max_year + future_years_count))
+
+generate_forecast <- function(cat) {
+  hist_data <- plot_data %>% filter(Category == cat)
+  if(nrow(hist_data) < 2) return(NULL)
+  
+  # Trend based on last 10 years
+  recent_trend_data <- hist_data %>% filter(Year >= current_max_year - 10)
+  
+  model <- lm(Count ~ Year, data = recent_trend_data)
+  
+  future_data <- future_range %>%
+    mutate(
+      Category = cat,
+      Count = predict(model, newdata = future_range),
+      Type = "Predicted"
+    )
+  
+  # Include the last point (2024) as "Predicted" so the lines connect visually
+  last_point <- hist_data %>% 
+    filter(Year == current_max_year) %>% 
+    mutate(Type = "Predicted")
+  
+  bind_rows(last_point, future_data)
+}
+
+forecast_data <- bind_rows(
+  generate_forecast("Retail"),
+  generate_forecast("Food & Bev"),
+  generate_forecast("Technology")
+)
+
+final_plot_data <- bind_rows(plot_data, forecast_data)
+
+# 5. Visualization (MODIFIED: Split into 3 plots)
+# -----------------------------------------------
+
+# Define a shared theme/color scale for consistency
+shared_theme <- list(
+  theme_minimal(),
+  scale_color_manual(values = c("Retail" = "#1f77b4", "Food & Bev" = "#ff7f0e", "Technology" = "#2ca02c")),
+  labs(y = "Number of Licences", color = "Category"),
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "bottom", size = 20)
+)
+
+# --- Graph 1: 1997 - 2012 ---
+data_phase1 <- final_plot_data %>% 
+  filter(Year >= 1997 & Year <= 2012 & Type == "Historical")
+
+p1 <- ggplot(data_phase1, aes(x = Year, y = Count, color = Category)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = seq(1997, 2012, 2)) +
+  labs(title = "Phase 1: Historical Trends (1997-2012)") +
+  shared_theme
+
+# --- Graph 2: 2013 - 2024 ---
+data_phase2 <- final_plot_data %>% 
+  filter(Year >= 2013 & Year <= 2024 & Type == "Historical")
+
+p2 <- ggplot(data_phase2, aes(x = Year, y = Count, color = Category)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = seq(2013, 2024, 1)) +
+  labs(title = "Phase 2: Recent Trends (2013-2024)") +
+  shared_theme
+
+# --- Graph 3: 2025 - Future (Forecast) ---
+# Note: We include the 'Predicted' rows (which includes the 2024 connector point)
+data_phase3 <- final_plot_data %>% 
+  filter(Type == "Predicted")
+
+p3 <- ggplot(data_phase3, aes(x = Year, y = Count, color = Category)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2, shape = 1) + # Hollow circles for prediction
+  scale_x_continuous(breaks = seq(2024, current_max_year + future_years_count, 1)) +
+  labs(title = paste0("Phase 3: Future Forecast (2025-", current_max_year + future_years_count, ")")) +
+  shared_theme
+
+# 6. Display and Save
+# -------------------
+
+# Display in RStudio Viewer
+print(p1)
+print(p2)
+print(p3)
+
+# Save to files
+ggsave("graph1_1997_2012.png", plot = p1, width = 10, height = 6)
+ggsave("graph2_2013_2024.png", plot = p2, width = 10, height = 6)
+ggsave("graph3_forecast.png", plot = p3, width = 10, height = 6)
