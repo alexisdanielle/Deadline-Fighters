@@ -1,0 +1,261 @@
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+
+# If you WANT elbow / silhouette plots later, install these and uncomment:
+# install.packages(c("cluster", "factoextra"))
+# library(cluster)
+# library(factoextra)
+
+# ==========================================
+# 0. DIAGNOSTICS
+# ==========================================
+print("--- STARTING SCRIPT ---")
+print(paste("Current Working Directory:", getwd()))
+
+# Check if the CSV files exist in this folder
+files_found <- list.files(pattern = "csv")
+if(length(files_found) > 0) {
+  print("CSV Files found in directory:")
+  print(files_found)
+} else {
+  warning("NO CSV FILES FOUND in the working directory! Please checking your setwd().")
+}
+
+# ==========================================
+# 1. DATA LOADING & MERGING
+# ==========================================
+
+# File paths
+url_current <- "business-licences.csv"
+url_2013_2024 <- "business-licences-2013-to-2024.csv"
+url_1997_2012 <- "business-licences-1997-to-2012.csv"
+
+# Function to load and do basic date parsing
+clean_date_load <- function(file_path) {
+  # Check if file exists
+  if(!file.exists(file_path)) {
+    warning(paste("File not found:", file_path))
+    return(NULL)
+  }
+  
+  print(paste("Loading:", file_path)) 
+  
+  # === SMART LOADING FIX ===
+  # 1. First, try reading with SEMICOLON (;) which is common in Vancouver Open Data
+  # We force col_types = "c" (text) to avoid the "double vs character" error.
+  raw_data <- read_delim(file_path, delim = ";", col_types = cols(.default = "c"), show_col_types = FALSE)
+  
+  # 2. If 'IssuedDate' isn't found, the semicolon parse failed. Try COMMA (,)
+  if(!"IssuedDate" %in% names(raw_data)) {
+    message(paste("Semicolon delimiter failed for", file_path, "- trying comma..."))
+    raw_data <- read_csv(file_path, col_types = cols(.default = "c"), show_col_types = FALSE)
+  }
+  
+  # 3. Final Check: Did we find the column?
+  if(!"IssuedDate" %in% names(raw_data)) {
+    print("Columns actually found in file:")
+    print(names(raw_data))
+    stop(paste("Column 'IssuedDate' still not found in", file_path, "- Check if the file is valid."))
+  }
+  
+  # DEBUG: Show what the dates actually look like
+  print(paste("First 5 dates in", file_path, ":"))
+  print(head(raw_data$IssuedDate, 5))
+
+  # Process the data with ROBUST DATE PARSING
+  processed_data <- raw_data %>%
+    select(IssuedDate, BusinessType, LocalArea, BusinessName) %>%
+    mutate(
+      # UPDATED: Removed "ISO8601" which caused the crash. 
+      # "ymd_HMS" handles the 'T' separator in 2024-05-15T14... automatically.
+      CleanDate = parse_date_time(IssuedDate, orders = c("ymd_HMS", "ymd HMS", "ymd", "mdy_HMS", "mdy HMS", "dmy_HMS", "dmy HMS")),
+      Year = year(CleanDate)
+    )
+    
+  # FALLBACK: If Year is still NA, try to extract just 4 digits using Regex
+  # This helps if the date is weird like "Monday, Jan 12, 2023"
+  processed_data <- processed_data %>%
+    mutate(
+      Year = if_else(is.na(Year), as.numeric(stringr::str_extract(IssuedDate, "\\d{4}")), Year)
+    ) %>%
+    filter(!is.na(Year))
+    
+  return(processed_data)
+}
+
+# Load raw data
+df_current_raw <- clean_date_load(url_current)
+df_2013_2024 <- clean_date_load(url_2013_2024)
+df_1997_2012 <- clean_date_load(url_1997_2012)
+
+# Check if dataframes are loaded
+if(is.null(df_1997_2012) || is.null(df_2013_2024) || is.null(df_current_raw)) {
+  stop("One or more datasets failed to load. Check file paths.")
+}
+
+# Fix overlap
+cutoff_year <- 2023
+
+df_history_clean <- bind_rows(df_1997_2012, df_2013_2024) %>%
+  filter(Year <= cutoff_year)
+
+df_current_clean <- df_current_raw %>%
+  filter(Year > cutoff_year)
+
+# Combine into main dataframe
+df <- bind_rows(
+  df_history_clean,
+  df_current_clean
+)
+
+# Check if df is empty before proceeding
+if(nrow(df) == 0) {
+  stop("CRITICAL ERROR: The combined dataset is empty. Date parsing likely failed for ALL rows.")
+}
+
+# ==========================================
+# 2. DATA CLEANING & ENGINEERING
+# ==========================================
+
+# Standardize names to lower case
+names(df) <- tolower(names(df))
+
+# Check required columns
+required_cols <- c("year", "localarea", "businessname", "businesstype")
+if(!all(required_cols %in% names(df))) {
+  stop(paste("Missing columns! The dataset needs:", paste(required_cols, collapse=", ")))
+}
+
+# Select and Clean columns
+df_clean <- df %>%
+  dplyr::select(
+    year,
+    localarea,
+    businessname,
+    businesstype
+  ) %>%
+  dplyr::mutate(
+    businessname = tolower(trimws(businessname)),
+    businesstype = tolower(trimws(businesstype)),
+    # Clean Local Area: Title Case
+    localarea = tools::toTitleCase(tolower(trimws(localarea)))
+  ) %>%
+  # Filter invalid areas
+  filter(
+    !is.na(localarea),
+    localarea != "",
+    tolower(localarea) != "other",
+    tolower(localarea) != "not applicable"
+  )
+
+# Create Industry Group
+df_clean <- df_clean %>%
+  dplyr::mutate(
+    IndustryGroup = dplyr::case_when(
+      grepl("retail|dealer|shop|store|market", businesstype, ignore.case = TRUE) ~ "Retail",
+      grepl("computer|software|tech|data|consultant|web", businesstype, ignore.case = TRUE) ~ "Technology",
+      grepl("restaurant|food|cafe|liquor|pub|club", businesstype, ignore.case = TRUE) ~ "Food & Bev",
+      TRUE ~ "Other"
+    )
+  )
+
+# ==========================================
+# 3. AGGREGATION & CLUSTERING
+# ==========================================
+
+# Feature engineering per LocalArea
+localarea_summary <- df_clean %>%
+  group_by(localarea) %>%
+  summarise(
+    total_businesses = n(),
+    total_retail_businesses = sum(IndustryGroup == "Retail"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    retail_density_proportion = total_retail_businesses / total_businesses
+  )
+
+# Keep areas with enough data
+localarea_clustering_data <- localarea_summary %>%
+  filter(
+    total_businesses >= 10,
+    !is.nan(retail_density_proportion)
+  )
+
+# Check if we have enough data to cluster
+if(nrow(localarea_clustering_data) < 4) {
+  stop("Not enough data points (Local Areas) to perform clustering with k=4. Date parsing may have failed, or 'localarea' column is empty.")
+}
+
+# Features for clustering
+clustering_features <- localarea_clustering_data %>%
+  select(total_retail_businesses, retail_density_proportion)
+
+# Scale features
+scaled_features <- scale(clustering_features)
+
+# ---- K-means clustering ----
+set.seed(123)
+k_optimal <- 4  # choose number of clusters
+kmeans_model <- kmeans(scaled_features, centers = k_optimal, nstart = 25)
+
+# Add cluster labels back
+localarea_clustering_data$cluster <- as.factor(kmeans_model$cluster)
+
+# ==========================================
+# 4. SUMMARY & VISUALIZATION
+# ==========================================
+
+# Cluster summary
+cluster_summary <- localarea_clustering_data %>%
+  group_by(cluster) %>%
+  summarise(
+    num_localareas = n(),
+    avg_total_businesses = mean(total_businesses),
+    avg_total_retail_businesses = mean(total_retail_businesses),
+    avg_retail_density_proportion = mean(retail_density_proportion),
+    .groups = "drop"
+  ) %>%
+  arrange(avg_retail_density_proportion)
+
+cat("\nCluster Summary:\n")
+print(cluster_summary)
+
+# Retail density by cluster
+p1 <- ggplot(localarea_clustering_data,
+             aes(x = cluster, y = retail_density_proportion, fill = cluster)) +
+  geom_boxplot() +
+  labs(
+    title = "Retail Density Proportion by Business District Cluster",
+    x = "Business District Cluster",
+    y = "Retail Density Proportion"
+  ) +
+  theme_minimal()
+
+print(p1)
+ggsave("cluster_p1.png", width = 12, height = 8, dpi = 300)
+
+# Total retail businesses by cluster
+p2 <- ggplot(localarea_clustering_data,
+             aes(x = cluster, y = total_retail_businesses, fill = cluster)) +
+  geom_boxplot() +
+  labs(
+    title = "Total Retail Businesses by Business District Cluster",
+    x = "Business District Cluster",
+    y = "Total Retail Businesses"
+  ) +
+  theme_minimal()
+
+print(p2)
+ggsave("cluster_p2.png", width = 12, height = 8, dpi = 300)
+
+# Top 10 LocalAreas in each cluster
+cat("\nLocal Areas by Cluster (Top 10 per cluster):\n")
+localarea_clustering_data %>%
+  select(localarea, cluster, retail_density_proportion) %>%
+  arrange(cluster, desc(retail_density_proportion)) %>%
+  group_by(cluster) %>%
+  slice_head(n = 10) %>%
+  print(n = Inf)
